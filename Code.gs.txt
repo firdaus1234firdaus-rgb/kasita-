@@ -1,0 +1,742 @@
+// =======================
+// 🔧 KONSTANTA
+// =======================
+const SPREADSHEET_ID = '1ev7SJttDFtXuMvHayi7AOYuWX4D8dBF-GGppDQ5BJAE';
+const SHEET_DATA = 'Transaksi';
+const SHEET_REF = 'Referensi';
+const FOLDER_UPLOAD = '16-IzzF-BAlN3LeHR9NJsTWQcYqMpqEhc';
+
+// HPP Produk (Inventory)
+const SHEET_PRODUK = 'Produk';
+const SHEET_MUTASI = 'Mutasi';
+
+// HPP Resep/Menu
+const SHEET_RESEP = 'Resep';
+const SHEET_RESEP_ITEM = 'ResepItem';
+const SHEET_HPP_RESEP = 'HPP_Resep';
+
+
+// =======================
+// 🧩 UTILITY
+// =======================
+const getSpreadsheet_ = () => SpreadsheetApp.openById(SPREADSHEET_ID);
+const getSheet_ = name => getSpreadsheet_().getSheetByName(name);
+
+function getSheetSafe_(name) {
+  const sh = getSheet_(name);
+  return sh || null;
+}
+
+function ensureSheet_(name, headers) {
+  const ss = getSpreadsheet_();
+  let sh = ss.getSheetByName(name);
+  if (!sh) sh = ss.insertSheet(name);
+  if (sh.getLastRow() === 0) sh.appendRow(headers);
+  return sh;
+}
+
+function include(filename) 
+{
+  return HtmlService.createHtmlOutputFromFile(filename).getContent();
+}
+
+function doGet() {
+  return HtmlService.createTemplateFromFile('Index')
+    .evaluate()
+    .setTitle('KASITA')
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1')
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+}
+
+function parseYmd_(ymd) {
+  if (!ymd) return null;
+  const [y, m, d] = ymd.split('-').map(Number);
+  return new Date(y, (m || 1) - 1, d || 1);
+}
+
+function ymdToday_() {
+  const tz = Session.getScriptTimeZone();
+  return Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd');
+}
+
+function normalizeUnit_(u){
+  const s = String(u||'').trim().toLowerCase();
+  if (!s) return '';
+  if (['g','gram','gr'].includes(s)) return 'g';
+  if (['kg','kilogram','kilo'].includes(s)) return 'kg';
+  if (['mg','miligram','milligram'].includes(s)) return 'mg';
+  if (['ml','milli','milliliter','mililiter'].includes(s)) return 'ml';
+  if (['l','lt','liter','litre'].includes(s)) return 'l';
+  if (['pcs','pc','piece','buah','btr','butir'].includes(s)) return 'pcs';
+  return s;
+}
+
+
+// =======================
+// 📋 REFERENSI (dropdown CASH)
+// =======================
+function getReferensi() {
+  const sheet = getSheetSafe_(SHEET_REF);
+  if (!sheet) return { kategoriPerJenis: {}, metode: [] };
+
+  const values = sheet.getDataRange().getValues();
+  if (values.length < 2) return { kategoriPerJenis: {}, metode: [] };
+  values.shift();
+
+  const kategoriPerJenis = {};
+  const metode = [...new Set(values.map(r => r[2]).filter(Boolean))];
+
+  values.forEach(([jenis, kategori]) => {
+    if (!jenis || !kategori) return;
+    if (!kategoriPerJenis[jenis]) kategoriPerJenis[jenis] = [];
+    if (!kategoriPerJenis[jenis].includes(kategori)) kategoriPerJenis[jenis].push(kategori);
+  });
+
+  return { kategoriPerJenis, metode };
+}
+
+
+// =======================
+// 📑 CASH: GET
+// =======================
+function getTransaksi() {
+  const sheet = getSheetSafe_(SHEET_DATA);
+  if (!sheet) return [];
+
+  const values = sheet.getDataRange().getValues();
+  if (!values || values.length < 2) return [];
+
+  values.shift();
+  const tz = Session.getScriptTimeZone();
+
+  return values.map(r => ({
+    id: r[0],
+    tanggal: r[1] ? Utilities.formatDate(new Date(r[1]), tz, 'yyyy-MM-dd') : '',
+    jenis: r[2],
+    kategori: r[3],
+    jumlah: r[4],
+    metode: r[5],
+    deskripsi: r[6],
+    file: r[7]
+  }));
+}
+
+function getNextId_() {
+  const sheet = getSheetSafe_(SHEET_DATA);
+  if (!sheet) throw new Error('Sheet Transaksi tidak ditemukan.');
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return 1;
+  return Number(sheet.getRange(lastRow, 1).getValue()) + 1;
+}
+
+function tambahTransaksi(data) {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    const sheet = getSheetSafe_(SHEET_DATA);
+    if (!sheet) throw new Error('Sheet Transaksi tidak ditemukan.');
+    const id = getNextId_();
+
+    sheet.appendRow([
+      id,
+      data.tanggal,
+      data.jenis,
+      data.kategori,
+      Number(data.jumlah),
+      data.metode,
+      data.deskripsi,
+      data.fileUrl || ''
+    ]);
+
+    return { success: true, message: `Transaksi #${id} berhasil disimpan` };
+  } catch (e) {
+    return { success: false, message: e.message };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function updateTransaksi(data) {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    const sheet = getSheetSafe_(SHEET_DATA);
+    if (!sheet) throw new Error('Sheet Transaksi tidak ditemukan.');
+
+    const values = sheet.getDataRange().getValues();
+    for (let i = 1; i < values.length; i++) {
+      if (values[i][0] != data.id) continue;
+
+      const oldFileUrl = values[i][7] || '';
+      if (data.fileUrl && data.fileUrl !== oldFileUrl) {
+        const oldFileId = oldFileUrl.match(/[-\w]{25,}/);
+        if (oldFileId && oldFileId[0]) {
+          try { DriveApp.getFileById(oldFileId[0]).setTrashed(true); } catch (err) {}
+        }
+      }
+
+      const fileUrlToSave = data.fileUrl || oldFileUrl || '';
+      sheet.getRange(i + 1, 2, 1, 7).setValues([[
+        data.tanggal,
+        data.jenis,
+        data.kategori,
+        Number(data.jumlah),
+        data.metode,
+        data.deskripsi,
+        fileUrlToSave
+      ]]);
+
+      return { success: true, message: `Transaksi #${data.id} berhasil diperbarui` };
+    }
+    return { success: false, message: 'Data tidak ditemukan' };
+  } catch (e) {
+    return { success: false, message: e.message };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function hapusTransaksi(id) {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    const sheet = getSheetSafe_(SHEET_DATA);
+    if (!sheet) throw new Error('Sheet Transaksi tidak ditemukan.');
+
+    const values = sheet.getDataRange().getValues();
+    for (let i = 1; i < values.length; i++) {
+      if (values[i][0] != id) continue;
+
+      const fileUrl = values[i][7];
+      if (fileUrl) {
+        try {
+          const fileIdMatch = fileUrl.match(/[-\w]{25,}/);
+          if (fileIdMatch && fileIdMatch[0]) DriveApp.getFileById(fileIdMatch[0]).setTrashed(true);
+        } catch (e) {}
+      }
+      sheet.deleteRow(i + 1);
+      return { success: true, message: `Transaksi #${id} dan file (jika ada) dihapus` };
+    }
+    return { success: false, message: 'Data tidak ditemukan' };
+  } catch (e) {
+    return { success: false, message: e.message };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+
+// =======================
+// 📤 UPLOAD FILE KE DRIVE
+// =======================
+function uploadFileToDrive(formObject) {
+  try {
+    const folder = DriveApp.getFolderById(FOLDER_UPLOAD);
+
+    const blob = Utilities.newBlob(
+      Utilities.base64Decode(formObject.content),
+      formObject.type,
+      formObject.name
+    );
+
+    const fileName = String(formObject.name || '').toLowerCase();
+    const mimeType = formObject.type;
+    const size = blob.getBytes().length;
+
+    const allowedTypes = [
+      'image/jpeg', 'image/png', 'application/pdf',
+      'application/msword', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      'application/vnd.ms-excel', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      'application/vnd.ms-powerpoint', 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+      'application/zip', 'application/x-rar-compressed'
+    ];
+    const allowedExt = [
+      '.jpg', '.jpeg', '.png', '.pdf',
+      '.doc', '.docx', '.xls', '.xlsx',
+      '.ppt', '.pptx', '.zip', '.rar'
+    ];
+    const maxSize = 10 * 1024 * 1024;
+
+    const extValid = allowedExt.some(ext => fileName.endsWith(ext));
+    const typeValid = allowedTypes.includes(mimeType);
+    if (!extValid && !typeValid) throw new Error('Tipe file tidak diizinkan.');
+    if (size > maxSize) throw new Error('Ukuran file terlalu besar (maksimum 10 MB).');
+
+    const file = folder.createFile(blob);
+    file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+    return { success: true, url: file.getUrl(), name: file.getName() };
+  } catch (e) {
+    return { success: false, message: e.message };
+  }
+}
+
+
+// =====================================================================
+// ======================= HPP PRODUK (Inventory) =======================
+// =====================================================================
+function ensureProdukMutasiSheets_() {
+  ensureSheet_(SHEET_PRODUK, ['Kode','Nama','Satuan','StokAwalQty','StokAwalModal']);
+  ensureSheet_(SHEET_MUTASI, ['ID','Tanggal','Tipe','KodeProduk','Qty','HargaModal','Catatan','File','Unit']);
+}
+
+function getProduk() {
+  ensureProdukMutasiSheets_();
+  const sheet = getSheet_(SHEET_PRODUK);
+  const values = sheet.getDataRange().getValues();
+  if (!values || values.length < 2) return [];
+  values.shift();
+
+  return values.filter(r => r[0]).map(r => ({
+    kode: String(r[0]).trim(),
+    nama: r[1] || '',
+    satuan: normalizeUnit_(r[2] || ''),
+    stokAwalQty: Number(r[3] || 0),
+    stokAwalModal: Number(r[4] || 0)
+  }));
+}
+
+function tambahProduk(p) {
+  ensureProdukMutasiSheets_();
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    const sheet = getSheet_(SHEET_PRODUK);
+    const kode = String(p.kode || '').trim();
+    if (!kode) return { success:false, message:'Kode wajib diisi' };
+
+    const existing = sheet.getDataRange().getValues().slice(1).some(r => String(r[0]).trim() === kode);
+    if (existing) return { success:false, message:'Kode produk sudah ada' };
+
+    sheet.appendRow([kode, p.nama || '', normalizeUnit_(p.satuan||''), Number(p.stokAwalQty||0), Number(p.stokAwalModal||0)]);
+    return { success:true, message:`Produk ${kode} ditambahkan` };
+  } catch (e) {
+    return { success:false, message:e.message };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function getNextMutasiId_() {
+  ensureProdukMutasiSheets_();
+  const sheet = getSheet_(SHEET_MUTASI);
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return 1;
+  return Number(sheet.getRange(lastRow, 1).getValue()) + 1;
+}
+
+function getMutasi() {
+  ensureProdukMutasiSheets_();
+  const sheet = getSheet_(SHEET_MUTASI);
+  const values = sheet.getDataRange().getValues();
+  if (!values || values.length < 2) return [];
+  values.shift();
+  const tz = Session.getScriptTimeZone();
+
+  return values.filter(r => r[0]).map(r => ({
+    id: r[0],
+    tanggal: r[1] ? Utilities.formatDate(new Date(r[1]), tz, 'yyyy-MM-dd') : '',
+    tipe: r[2] || '',
+    kodeProduk: r[3] || '',
+    qty: Number(r[4] || 0),
+    hargaModal: Number(r[5] || 0),
+    catatan: r[6] || '',
+    file: r[7] || '',
+    unit: normalizeUnit_(r[8] || '')
+  }));
+}
+
+function tambahMutasi(m) {
+  ensureProdukMutasiSheets_();
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    const sheet = getSheet_(SHEET_MUTASI);
+    const id = getNextMutasiId_();
+
+    const tipe = String(m.tipe || '').trim();
+    const kodeProduk = String(m.kodeProduk || '').trim();
+    const qty = Number(m.qty || 0);
+    const hargaModal = Number(m.hargaModal || 0);
+    const unit = normalizeUnit_(m.unit || '');
+
+    if (!m.tanggal || !tipe || !kodeProduk) return { success:false, message:'Tanggal/tipe/produk wajib diisi' };
+    if (qty <= 0) return { success:false, message:'Qty harus > 0' };
+    if (tipe === 'Pembelian' && hargaModal <= 0) return { success:false, message:'Harga modal wajib untuk pembelian' };
+
+    sheet.appendRow([id, m.tanggal, tipe, kodeProduk, qty, hargaModal, m.catatan || '', m.fileUrl || '', unit]);
+    return { success:true, message:`Mutasi #${id} disimpan` };
+  } catch (e) {
+    return { success:false, message:e.message };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function hapusMutasi(id) {
+  ensureProdukMutasiSheets_();
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    const sheet = getSheet_(SHEET_MUTASI);
+    const values = sheet.getDataRange().getValues();
+    for (let i = 1; i < values.length; i++) {
+      if (values[i][0] != id) continue;
+
+      const fileUrl = values[i][7];
+      if (fileUrl) {
+        try {
+          const m = String(fileUrl).match(/[-\w]{25,}/);
+          if (m && m[0]) DriveApp.getFileById(m[0]).setTrashed(true);
+        } catch(e) {}
+      }
+      sheet.deleteRow(i + 1);
+      return { success:true, message:`Mutasi #${id} dihapus` };
+    }
+    return { success:false, message:'Mutasi tidak ditemukan' };
+  } catch (e) {
+    return { success:false, message:e.message };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function hapusProduk(kode) {
+  ensureProdukMutasiSheets_();
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    const kodeKey = String(kode || '').trim();
+    if (!kodeKey) return { success:false, message:'Kode produk kosong' };
+
+    const shProduk = getSheet_(SHEET_PRODUK);
+    const data = shProduk.getDataRange().getValues();
+
+    for (let i = 1; i < data.length; i++) {
+      if (String(data[i][0]).trim() !== kodeKey) continue;
+      shProduk.deleteRow(i + 1);
+      return { success:true, message:`Produk ${kodeKey} dihapus` };
+    }
+    return { success:false, message:'Produk tidak ditemukan' };
+  } catch (e) {
+    return { success:false, message:e.message };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function hapusMutasiByProduk(kodeProduk) {
+  ensureProdukMutasiSheets_();
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    const kodeKey = String(kodeProduk || '').trim();
+    if (!kodeKey) return { success:false, message:'Kode produk kosong' };
+
+    const sh = getSheet_(SHEET_MUTASI);
+    const values = sh.getDataRange().getValues();
+
+    let deleted = 0;
+    for (let i = values.length - 1; i >= 1; i--) {
+      if (String(values[i][3]).trim() !== kodeKey) continue;
+
+      const fileUrl = values[i][7];
+      if (fileUrl) {
+        try {
+          const m = String(fileUrl).match(/[-\w]{25,}/);
+          if (m && m[0]) DriveApp.getFileById(m[0]).setTrashed(true);
+        } catch(e) {}
+      }
+
+      sh.deleteRow(i + 1);
+      deleted++;
+    }
+
+    return { success:true, message:`Mutasi untuk ${kodeKey} dihapus: ${deleted} baris` };
+  } catch (e) {
+    return { success:false, message:e.message };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function getHppReport(startYmd, endYmd) {
+  const start = parseYmd_(startYmd); if (!start) return { success:false, message:'start tidak valid' };
+  const end = parseYmd_(endYmd);     if (!end) return { success:false, message:'end tidak valid' };
+  end.setHours(23,59,59,999);
+
+  const produk = getProduk();
+  const mutasi = getMutasi()
+    .filter(m => m.tanggal)
+    .sort((a,b) => (a.tanggal === b.tanggal) ? (a.id - b.id) : (a.tanggal < b.tanggal ? -1 : 1));
+
+  const prodMap = {};
+  produk.forEach(p => { prodMap[p.kode] = p; });
+
+  const state = {};
+  produk.forEach(p => {
+    const qty = Number(p.stokAwalQty || 0);
+    const avg = Number(p.stokAwalModal || 0);
+    state[p.kode] = { qtyOnHand: qty, avgCost: avg, invValue: qty * avg, cogsRange: 0, soldQtyRange: 0 };
+  });
+
+  mutasi.forEach(m => {
+    if (!state[m.kodeProduk]) {
+      state[m.kodeProduk] = { qtyOnHand:0, avgCost:0, invValue:0, cogsRange:0, soldQtyRange:0 };
+      if (!prodMap[m.kodeProduk]) prodMap[m.kodeProduk] = { kode:m.kodeProduk, nama:'', satuan:'', stokAwalQty:0, stokAwalModal:0 };
+    }
+  });
+
+  mutasi.forEach(m => {
+    const t = parseYmd_(m.tanggal);
+    if (!t) return;
+
+    const st = state[m.kodeProduk];
+    const qty = Number(m.qty || 0);
+    const modal = Number(m.hargaModal || 0);
+
+    if (m.tipe === 'Pembelian') {
+      st.invValue += qty * modal;
+      st.qtyOnHand += qty;
+      st.avgCost = st.qtyOnHand > 0 ? (st.invValue / st.qtyOnHand) : 0;
+    }
+
+    if (m.tipe === 'Penjualan') {
+      const unit = st.avgCost || 0;
+      const cogs = qty * unit;
+
+      st.qtyOnHand -= qty;
+      st.invValue -= cogs;
+      if (st.qtyOnHand < 0) st.qtyOnHand = 0;
+      if (st.invValue < 0) st.invValue = 0;
+
+      if (t >= start && t <= end) {
+        st.cogsRange += cogs;
+        st.soldQtyRange += qty;
+      }
+    }
+  });
+
+  const rows = Object.keys(state).map(kode => {
+    const p = prodMap[kode] || { kode, nama:'', satuan:'' };
+    const st = state[kode];
+    return {
+      kode,
+      nama: p.nama || '',
+      satuan: p.satuan || '',
+      terjualQty: st.soldQtyRange,
+      hpp: Math.round(st.cogsRange),
+      stokAkhirQty: st.qtyOnHand,
+      avgModal: Math.round(st.avgCost || 0),
+      nilaiPersediaan: Math.round(st.invValue || 0)
+    };
+  }).sort((a,b) => a.kode.localeCompare(b.kode));
+
+  const totalHpp = rows.reduce((s,r)=>s+Number(r.hpp||0),0);
+  const totalNilaiPersediaan = rows.reduce((s,r)=>s+Number(r.nilaiPersediaan||0),0);
+
+  return { success:true, start:startYmd, end:endYmd, totalHpp, totalNilaiPersediaan, rows };
+}
+
+
+// =====================================================================
+// ======================= HPP RESEP / MENU ============================
+// =====================================================================
+function ensureResepSheets_() {
+  ensureSheet_(SHEET_RESEP, ['ResepID','NamaMenu','PorsiYield','Catatan','CreatedAt']);
+  ensureSheet_(SHEET_RESEP_ITEM, ['ResepID','KodeBahan','QtyPerPorsi','UnitBase','WastePct']);
+  ensureSheet_(SHEET_HPP_RESEP, ['Timestamp','ResepID','NamaMenu','PorsiYield','AsOf','HppPerPorsi','HppBatch','ProfitMode','ProfitPct','HargaJualPerPorsi','Catatan']);
+}
+
+function getInventoryStateAsOf_(asOfYmd) {
+  const asOf = parseYmd_(asOfYmd);
+  if (!asOf) throw new Error('Tanggal as-of tidak valid');
+  asOf.setHours(23,59,59,999);
+
+  const produk = getProduk();
+  const mutasi = getMutasi()
+    .filter(m => m.tanggal)
+    .sort((a,b) => (a.tanggal === b.tanggal) ? (a.id - b.id) : (a.tanggal < b.tanggal ? -1 : 1));
+
+  const state = {};
+  produk.forEach(p => {
+    const qty = Number(p.stokAwalQty || 0);
+    const avg = Number(p.stokAwalModal || 0);
+    state[p.kode] = { qtyOnHand: qty, avgCost: avg, invValue: qty * avg };
+  });
+
+  mutasi.forEach(m => { if (!state[m.kodeProduk]) state[m.kodeProduk] = { qtyOnHand:0, avgCost:0, invValue:0 }; });
+
+  mutasi.forEach(m => {
+    const t = parseYmd_(m.tanggal);
+    if (!t || t > asOf) return;
+
+    const st = state[m.kodeProduk];
+    const qty = Number(m.qty || 0);
+    const modal = Number(m.hargaModal || 0);
+
+    if (m.tipe === 'Pembelian') {
+      st.invValue += qty * modal;
+      st.qtyOnHand += qty;
+      st.avgCost = st.qtyOnHand > 0 ? (st.invValue / st.qtyOnHand) : 0;
+    }
+
+    if (m.tipe === 'Penjualan') {
+      const unit = st.avgCost || 0;
+      const cogs = qty * unit;
+      st.qtyOnHand -= qty;
+      st.invValue -= cogs;
+      if (st.qtyOnHand < 0) st.qtyOnHand = 0;
+      if (st.invValue < 0) st.invValue = 0;
+    }
+  });
+
+  return state;
+}
+
+function getHppResepHistory(limit = 200) {
+  ensureResepSheets_();
+  const sh = getSheet_(SHEET_HPP_RESEP);
+  if (!sh) return [];
+
+  const lastRow = sh.getLastRow();
+  if (lastRow < 2) return [];
+
+  const take = Math.max(1, Number(limit || 200));
+  const nRows = lastRow - 1;
+
+  const values = sh.getRange(2, 1, nRows, 11).getDisplayValues();
+  values.reverse();
+
+  return values.slice(0, take).map(r => ({
+    timestamp: r[0] || '',
+    resepId: r[1] || '',
+    namaMenu: r[2] || '',
+    porsiYield: r[3] || '',
+    asOf: r[4] || '',
+    hppPerPorsi: Number(String(r[5] || 0).replace(/[^\d.-]/g,'')) || 0,
+    hppBatch: Number(String(r[6] || 0).replace(/[^\d.-]/g,'')) || 0,
+    profitMode: r[7] || '',
+    profitPct: Number(String(r[8] || 0).replace(/[^\d.-]/g,'')) || 0,
+    hargaJualPerPorsi: Number(String(r[9] || 0).replace(/[^\d.-]/g,'')) || 0,
+    catatan: r[10] || ''
+  }));
+}
+
+function saveAndHitungHppResep(payload) {
+  ensureResepSheets_();
+
+  const namaMenu = String(payload.namaMenu || '').trim();
+  const porsiYield = Number(payload.porsiYield || 0);
+  const profitMode = String(payload.profitMode || 'markup');
+  const profitPct = Number(payload.profitPct || 0);
+  const catatan = String(payload.catatan || '').trim();
+  const asOfYmd = String(payload.asOfYmd || ymdToday_());
+  const items = Array.isArray(payload.items) ? payload.items : [];
+
+  if (!namaMenu) return { success:false, message:'Nama menu wajib.' };
+  if (porsiYield <= 0) return { success:false, message:'Yield porsi harus > 0.' };
+  if (!items.length) return { success:false, message:'Minimal 1 bahan.' };
+  if (profitPct < 0) return { success:false, message:'Persen untung tidak boleh minus.' };
+  if (profitMode === 'margin' && profitPct >= 100) return { success:false, message:'Margin tidak boleh >= 100%.' };
+
+  const inv = getInventoryStateAsOf_(asOfYmd);
+
+  let hppPerPorsiRaw = 0;
+  const detail = [];
+
+  items.forEach(it => {
+    const kode = String(it.kodeBahan || '').trim();
+    const qtyBase = Number(it.qtyBase || 0);
+    const unitBase = normalizeUnit_(it.unitBase || '');
+    const wastePct = Number(it.wastePct || 0);
+    if (!kode || qtyBase <= 0) return;
+
+    const st = inv[kode] || { avgCost: 0 };
+    const avgCost = Number(st.avgCost || 0);
+
+    const effQty = qtyBase * (1 + (wastePct > 0 ? wastePct : 0) / 100);
+    const cost = effQty * avgCost;
+
+    hppPerPorsiRaw += cost;
+    detail.push({ kodeBahan:kode, qtyBase, unitBase, wastePct, avgCost, cost });
+  });
+
+  const hppPerPorsi = Math.round(hppPerPorsiRaw);
+  const hppBatch = Math.round(hppPerPorsi * porsiYield);
+
+  let hargaJualPerPorsi = 0;
+  if (profitMode === 'markup') hargaJualPerPorsi = Math.round(hppPerPorsi * (1 + profitPct / 100));
+  else hargaJualPerPorsi = Math.round(hppPerPorsi / (1 - profitPct / 100));
+
+  const shResep = getSheet_(SHEET_RESEP);
+  const last = shResep.getLastRow();
+  const resepId = (last < 2) ? 1 : Number(shResep.getRange(last, 1).getValue()) + 1;
+
+  shResep.appendRow([resepId, namaMenu, porsiYield, catatan, new Date()]);
+
+  const shItem = getSheet_(SHEET_RESEP_ITEM);
+  detail.forEach(d => shItem.appendRow([resepId, d.kodeBahan, d.qtyBase, d.unitBase, d.wastePct || 0]));
+
+  const shHpp = getSheet_(SHEET_HPP_RESEP);
+  shHpp.appendRow([new Date(), resepId, namaMenu, porsiYield, asOfYmd, hppPerPorsi, hppBatch, profitMode, profitPct, hargaJualPerPorsi, catatan]);
+
+  return { success:true, resepId, namaMenu, porsiYield, asOfYmd, hppPerPorsi, hppBatch, profitMode, profitPct, hargaJualPerPorsi, detail };
+}
+
+// =======================
+// 🗑️ HAPUS HPP RESEP / MENU
+// =======================
+function hapusHppResep(resepId) {
+  ensureResepSheets_();
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    const id = String(resepId || '').trim();
+    if (!id) return { success: false, message: 'ResepID kosong' };
+
+    const shHpp = getSheet_(SHEET_HPP_RESEP);
+    const shResep = getSheet_(SHEET_RESEP);
+    const shItem = getSheet_(SHEET_RESEP_ITEM);
+
+    const hppVals = shHpp.getDataRange().getValues();
+    let delHpp = 0;
+    for (let i = hppVals.length - 1; i >= 1; i--) {
+      if (String(hppVals[i][1]).trim() === id) {
+        shHpp.deleteRow(i + 1);
+        delHpp++;
+      }
+    }
+
+    const itemVals = shItem.getDataRange().getValues();
+    let delItem = 0;
+    for (let i = itemVals.length - 1; i >= 1; i--) {
+      if (String(itemVals[i][0]).trim() === id) {
+        shItem.deleteRow(i + 1);
+        delItem++;
+      }
+    }
+
+    const resepVals = shResep.getDataRange().getValues();
+    let delResep = 0;
+    for (let i = resepVals.length - 1; i >= 1; i--) {
+      if (String(resepVals[i][0]).trim() === id) {
+        shResep.deleteRow(i + 1);
+        delResep++;
+        break;
+      }
+    }
+
+    if (!delHpp && !delItem && !delResep) {
+      return { success: false, message: `ResepID ${id} tidak ditemukan` };
+    }
+
+    return {
+      success: true,
+      message: `ResepID ${id} dihapus (HPP_Resep:${delHpp}, ResepItem:${delItem}, Resep:${delResep})`
+    };
+  } catch (e) {
+    return { success: false, message: e.message };
+  } finally {
+    lock.releaseLock();
+  }
+}
